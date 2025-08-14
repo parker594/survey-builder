@@ -1,0 +1,320 @@
+# Smart Survey Tool - Docker Compose Configuration
+# Government of India - Ministry of Statistics and Programme Implementation
+version: '3.8'
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:6.0
+    container_name: survey_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-password123}
+      MONGO_INITDB_DATABASE: smart_survey_tool
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - survey_network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: survey_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis123}
+    volumes:
+      - redis_data:/data
+    networks:
+      - survey_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Backend API Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/Dockerfile.backend
+    container_name: survey_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 5000
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-password123}@mongodb:27017/smart_survey_tool?authSource=admin
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379
+      JWT_SECRET: ${JWT_SECRET:-your-jwt-secret-here}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GOOGLE_CLOUD_API_KEY: ${GOOGLE_CLOUD_API_KEY}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      FRONTEND_URL: http://localhost:3000
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/logs:/app/logs
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - survey_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend React Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      args:
+        REACT_APP_API_URL: http://localhost:5000/api
+        REACT_APP_AI_URL: http://localhost:8000
+        REACT_APP_SOCKET_URL: http://localhost:5000
+    container_name: survey_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - survey_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # AI Services (Python)
+  ai-services:
+    build:
+      context: ./ai-services
+      dockerfile: ../docker/Dockerfile.ai
+    container_name: survey_ai_services
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GOOGLE_CLOUD_API_KEY: ${GOOGLE_CLOUD_API_KEY}
+      FLASK_ENV: ${FLASK_ENV:-development}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - survey_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx Reverse Proxy (Production)
+  nginx:
+    image: nginx:alpine
+    container_name: survey_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - frontend
+      - backend
+      - ai-services
+    networks:
+      - survey_network
+    profiles:
+      - production
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: survey_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - survey_network
+    profiles:
+      - monitoring
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: survey_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_USERS_ALLOW_SIGN_UP: false
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - survey_network
+    profiles:
+      - monitoring
+
+  # ElasticSearch for Logging
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: survey_elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - survey_network
+    profiles:
+      - logging
+
+  # Kibana for Log Visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    container_name: survey_kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - survey_network
+    profiles:
+      - logging
+
+  # Logstash for Log Processing
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.8.0
+    container_name: survey_logstash
+    restart: unless-stopped
+    volumes:
+      - ./docker/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./docker/logstash/config:/usr/share/logstash/config:ro
+      - ./backend/logs:/app/logs:ro
+    depends_on:
+      - elasticsearch
+    networks:
+      - survey_network
+    profiles:
+      - logging
+
+  # pgAdmin for Database Management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: survey_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@mospi.gov.in}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin123}
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - survey_network
+    profiles:
+      - development
+
+  # Backup Service
+  backup:
+    build:
+      context: ./docker/backup
+      dockerfile: Dockerfile
+    container_name: survey_backup
+    restart: unless-stopped
+    environment:
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-password123}@mongodb:27017/smart_survey_tool?authSource=admin
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      BACKUP_SCHEDULE: "0 2 * * *"  # Daily at 2 AM
+      RETENTION_DAYS: 30
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      - mongodb
+    networks:
+      - survey_network
+    profiles:
+      - production
+
+# Networks
+networks:
+  survey_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Volumes
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+  nginx_logs:
+    driver: local
+
+# Configuration for different environments
+# Development: docker-compose up -d
+# Production: docker-compose --profile production up -d
+# With Monitoring: docker-compose --profile monitoring up -d
+# With Logging: docker-compose --profile logging up -d
+# Full Stack: docker-compose --profile production --profile monitoring --profile logging up -d
